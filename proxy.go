@@ -10,87 +10,77 @@ import (
 	"time"
 )
 
-// performClientHandshake handles the client side of the handshake protocol
-func performClientHandshake(conn net.Conn, pluginName string) error {
-	// Validate plugin name
+// performClientHandshake sends "<plugin> <state-machine>" and waits for OK.
+// It returns the reader the plugin's output must be read from, since it may
+// already hold bytes that arrived after the OK line.
+func performClientHandshake(conn net.Conn, pluginName, stateMachine string) (*bufio.Reader, error) {
 	if err := validatePluginName(pluginName); err != nil {
-		return fmt.Errorf("invalid plugin name: %w", err)
+		return nil, fmt.Errorf("invalid plugin name: %w", err)
+	}
+	if err := validateStateMachine(stateMachine); err != nil {
+		return nil, err
 	}
 
-	// Set read timeout for handshake
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set read deadline: %w", err)
+		return nil, fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
-	// Send plugin name
-	if _, err := fmt.Fprintf(conn, "%s\n", pluginName); err != nil {
-		return fmt.Errorf("failed to send plugin name: %w", err)
+	if _, err := fmt.Fprintf(conn, "%s %s\n", pluginName, stateMachine); err != nil {
+		return nil, fmt.Errorf("failed to send handshake: %w", err)
 	}
 
-	// Read response
 	reader := bufio.NewReader(conn)
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("failed to read handshake response: %w", err)
+		return nil, fmt.Errorf("failed to read handshake response: %w", err)
 	}
-
 	response = strings.TrimSpace(response)
 
-	// Parse response
 	if response == "OK" {
-		// Clear read deadline for data proxying
-		conn.SetReadDeadline(time.Time{})
-		return nil
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			return nil, fmt.Errorf("failed to clear read deadline: %w", err)
+		}
+		return reader, nil
 	}
-
-	if strings.HasPrefix(response, "ERROR ") {
-		errorMsg := strings.TrimPrefix(response, "ERROR ")
-		return fmt.Errorf("server error: %s", errorMsg)
+	if errorMsg, ok := strings.CutPrefix(response, "ERROR "); ok {
+		return nil, fmt.Errorf("server error: %s", errorMsg)
 	}
-
-	return fmt.Errorf("unexpected handshake response: %s", response)
+	return nil, fmt.Errorf("unexpected handshake response: %s", response)
 }
 
-// runProxy implements the proxy subcommand
-func runProxy(pluginName string) error {
-	// Get socket path
-	socketPath := getSocketPath()
+// pipe copies in to the socket and the socket to out. It returns once the
+// server closes the connection, which happens when the plugin exits. It does
+// not wait for in to reach EOF: age keeps the plugin's stdin open until it
+// has read the plugin's final answer, so waiting would deadlock when the
+// plugin fails.
+func pipe(conn *net.UnixConn, fromConn io.Reader, in io.Reader, out io.Writer) error {
+	go func() {
+		if _, err := io.Copy(conn, in); err == nil {
+			_ = conn.CloseWrite()
+		}
+	}()
+	_, err := io.Copy(out, fromConn)
+	return err
+}
 
-	// Connect to Unix domain socket
-	conn, err := net.Dial("unix", socketPath)
+// runProxy connects to the server and proxies stdin/stdout for one plugin
+// invocation. args are the arguments age passed to the plugin.
+func runProxy(pluginName string, args []string) error {
+	stateMachine, err := parseStateMachine(args)
+	if err != nil {
+		return err
+	}
+
+	socketPath := getSocketPath()
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("failed to connect to server at %s: %w", socketPath, err)
 	}
 	defer conn.Close()
 
-	// Perform handshake
-	if err := performClientHandshake(conn, pluginName); err != nil {
+	reader, err := performClientHandshake(conn, pluginName, stateMachine)
+	if err != nil {
 		return err
 	}
-
-	// Start bidirectional proxying
-	done := make(chan error, 2)
-
-	// Goroutine: stdin -> socket
-	go func() {
-		_, err := io.Copy(conn, os.Stdin)
-		done <- err
-	}()
-
-	// Main thread: socket -> stdout
-	go func() {
-		_, err := io.Copy(os.Stdout, conn)
-		done <- err
-	}()
-
-	// Wait for either direction to complete
-	err = <-done
-
-	// Close connection to stop the other goroutine
-	conn.Close()
-
-	// Wait for the second goroutine to finish
-	<-done
-
-	return err
+	return pipe(conn, reader, os.Stdin, os.Stdout)
 }

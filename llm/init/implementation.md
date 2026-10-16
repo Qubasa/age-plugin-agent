@@ -6,18 +6,6 @@ This implementation creates an age plugin agent in Go that intercepts age plugin
 
 ## Data Structures
 
-### Configuration and State
-
-**File: `config.go`**
-
-```go
-type Config struct {
-    SocketPath string
-}
-```
-
-**Purpose**: Store runtime configuration such as Unix socket file path.
-
 ### Protocol Messages
 
 **File: `protocol.go`**
@@ -26,15 +14,13 @@ type Config struct {
 const (
     MaxPluginNameLength = 64
     PluginNamePattern   = `^[a-zA-Z0-9-]+$`
+    maxHandshakeLine    = 128
 )
 
-type HandshakeResponse struct {
-    Success bool
-    Error   string
-}
+var stateMachines = map[string]bool{"identity-v1": true, "recipient-v1": true}
 ```
 
-**Purpose**: Define constants and types for the handshake protocol between client and server.
+**Purpose**: Define constants for the handshake protocol, and `parseStateMachine(args)`, which reads the `--age-plugin=<state-machine>` argument age passes to a plugin.
 
 ## Functions by Module
 
@@ -73,95 +59,64 @@ type HandshakeResponse struct {
 
 ### File: `cmd/proxy.go` or `proxy.go`
 
-#### `runProxy(pluginName string)` [req.nc6prq] [req.erkwws]
+#### `runProxy(pluginName string, args []string)` [req.nc6prq] [req.erkwws]
 
 **Description**: Implementation of the `proxy` subcommand. Connects to the server and proxies stdin/stdout:
-1. Validate the socket path from configuration or environment variable
-2. Connect to the Unix domain socket using `net.Dial("unix", socketPath)`
+1. Parse the state machine from `args` (call `parseStateMachine()`)
+2. Connect to the Unix domain socket from `getSocketPath()`
 3. Perform the client-side handshake (call `performClientHandshake()`)
 4. If handshake fails, write error to stderr and exit with non-zero status
-5. If handshake succeeds, start bidirectional proxying:
-   - Launch a goroutine to copy from stdin to socket (`io.Copy(conn, os.Stdin)`)
-   - In the main goroutine, copy from socket to stdout (`io.Copy(os.Stdout, conn)`)
-   - Wait for both copies to complete
-6. Close the connection and exit
+5. If handshake succeeds, proxy with `pipe()`:
+   - A goroutine copies stdin to the socket, then half-closes the socket for writing
+   - The main goroutine copies from the handshake reader to stdout
+   - Return as soon as the server closes the connection. Never wait for stdin to end: age keeps it open until it has read the plugin's answer, so waiting deadlocks when the plugin fails
 
-#### `performClientHandshake(conn net.Conn, pluginName string) error` [req.erkwws]
+#### `performClientHandshake(conn net.Conn, pluginName, stateMachine string) (*bufio.Reader, error)` [req.erkwws]
 
 **Description**: Handles the client side of the handshake protocol:
-1. Validate plugin name format using regex `^[a-zA-Z0-9-]+$` and max length 64
-2. Write plugin name followed by newline to the connection: `fmt.Fprintf(conn, "%s\n", pluginName)`
-3. Read the response line using `bufio.NewReader(conn).ReadString('\n')`
-4. Parse the response:
-   - If it starts with `OK`, return nil (success)
-   - If it starts with `ERROR`, extract the error message and return an error
-   - Otherwise, return an error for unexpected response format
-5. Set appropriate read timeout to prevent indefinite blocking
+1. Validate plugin name and state machine
+2. Write `<plugin-name> <state-machine>\n`
+3. Read the response line, with a 10 second timeout
+4. On `OK`, return the reader, which may already hold plugin output
+5. On `ERROR <msg>`, return the message as an error; anything else is an unexpected response
 
 ### File: `cmd/server.go` or `server.go`
 
-#### `runServer(socketPath string)` [req.nc6prq] [req.lv5ejb] [req.nytk77]
+#### `runServer(args []string)` [req.nc6prq] [req.lv5ejb] [req.nytk77]
 
-**Description**: Implementation of the `server` subcommand. Starts a Unix domain socket server:
-1. Remove any existing socket file at the path (handle `os.ErrNotExist` gracefully)
-2. Create a Unix domain socket listener using `net.Listen("unix", socketPath)`
-3. Set appropriate permissions on the socket file (e.g., 0600 for security)
-4. Set up signal handling (SIGINT, SIGTERM) for graceful shutdown
-5. Enter accept loop:
-   - Accept incoming connections
-   - For each connection, spawn a goroutine to handle it (`handleConnection()`)
-6. On shutdown signal, close the listener and clean up the socket file
+**Description**: Implementation of the `server` subcommand:
+1. Parse repeatable `--plugin <abs-path>` flags and an optional socket path
+2. Build the plugin allowlist (call `loadPlugins()`)
+3. Bind the socket (call `listen()`)
+4. Set up signal handling (SIGINT, SIGTERM) that closes the listener
+5. Accept connections (call `serve()`), one `handleConnection()` goroutine each
 
-**Note**: Server emits operational logs to stdout (e.g., server started, connection accepted, plugin executed, errors encountered). This allows operators to monitor server activity and debug issues.
+**Note**: Server emits operational logs to stdout and stderr. Plugin stderr is passed through, so a plugin's own log ends up in the server's.
 
-#### `handleConnection(conn net.Conn)` [req.lv5ejb]
+#### `loadPlugins(paths []string) (map[string]string, error)` [req.lv5ejb]
 
-**Description**: Handles a single client connection. Called in a goroutine for each accepted connection:
-1. Ensure connection is closed when function exits (using `defer conn.Close()`)
-2. Perform server-side handshake (call `performServerHandshake()`)
-3. If handshake fails, the handshake function handles sending the error response
-4. If handshake succeeds, receive the plugin command to execute
-5. Start bidirectional proxying (call `proxyToPlugin()`)
-6. Wait for the plugin to exit
-7. Close the connection (handled by defer)
+**Description**: Maps plugin names to the only executables the server may run. Each path must be absolute, named `age-plugin-<name>` with a valid name other than `agent`, a regular executable file, and not repeat a name. `$PATH` is never searched: the client picks the name, so anything able to write to a `$PATH` directory could otherwise choose what the server executes.
 
-#### `performServerHandshake(conn net.Conn) (string, error)` [req.lv5ejb]
+#### `listen(socketPath string) (*net.UnixListener, error)` [req.nytk77]
+
+**Description**: Replaces a stale socket but refuses to remove anything that is not a socket. Binds under umask 077, so the socket is never accessible to group or others.
+
+#### `performServerHandshake(conn net.Conn, plugins map[string]string)` [req.lv5ejb]
 
 **Description**: Handles the server side of the handshake protocol:
-1. Set a read timeout on the connection (e.g., 10 seconds)
-2. Read the plugin name line using `bufio.NewReader(conn).ReadString('\n')`
-3. Trim whitespace from the plugin name
-4. Validate the plugin name:
-   - Check length <= 64 characters
-   - Check format using regex `^[a-zA-Z0-9-]+$`
-   - If invalid, send `ERROR invalid plugin name: <name>\n` and return error
-5. Search for the plugin binary (call `findPluginBinary()`)
-6. If plugin not found or not executable, send appropriate error response and return error
-7. If validation succeeds, send `OK\n` to the client
-8. Return the plugin name for further processing
+1. Set a 10 second read timeout
+2. Read one line of at most 128 bytes
+3. Split it into plugin name and state machine, validate both, and look the name up in the allowlist
+4. On failure, send `ERROR <message>\n` without echoing unvalidated input
+5. On success, send `OK\n` and return the plugin path, state machine, and the reader holding any further client bytes
 
-#### `findPluginBinary(pluginName string) (string, error)`
+#### `proxyToPlugin(conn *net.UnixConn, fromConn io.Reader, pluginPath, stateMachine string)` [req.lv5ejb]
 
-**Description**: Searches `$PATH` for the age plugin binary:
-1. Construct the binary name: `age-plugin-<pluginName>`
-2. Use `exec.LookPath()` to search for the binary in `$PATH`
-3. If found, verify it's executable:
-   - Use `os.Stat()` to get file info
-   - Check file mode has execute bit set
-4. Return the full path if found and executable
-5. Return appropriate error if not found or not executable
-
-#### `proxyToPlugin(conn net.Conn, pluginPath string)` [req.lv5ejb]
-
-**Description**: Spawns the plugin subprocess and proxies data bidirectionally:
-1. Create a command using `exec.Command(pluginPath)`
-2. Set up stdin/stdout pipes for the plugin process
-3. Start the plugin process
-4. Launch two goroutines for bidirectional copying:
-   - Goroutine 1: Copy from socket to plugin stdin
-   - Goroutine 2: Copy from plugin stdout to socket
-5. Wait for the plugin process to exit using `cmd.Wait()`
-6. Close pipes and connection (errors from plugin are propagated to the age client via stdout)
+**Description**: Spawns the plugin and proxies data bidirectionally:
+1. Run `<pluginPath> --age-plugin=<stateMachine>` with stdin/stdout pipes
+2. A goroutine copies from the client to the plugin's stdin
+3. Copy the plugin's stdout to the socket until EOF, and only then call `cmd.Wait()`, which closes the pipe and would otherwise drop the plugin's last messages
+4. Close the connection
 
 ### File: `util.go` or `validation.go`
 
@@ -216,9 +171,10 @@ This function is used by both client and server to ensure they use the same sock
 
 ### Security Considerations
 
-- Plugin name validation prevents path traversal attacks
-- Symlinks are followed but validated
-- Socket permissions restrict access
+- The server only runs plugins from its `--plugin` allowlist, by absolute path
+- Plugin name and state machine validation prevents path traversal and argument injection
+- The handshake line is bounded and invalid input is not echoed
+- The socket is created owner-only
 - No global variables; configuration passed through function parameters or struct fields
 
 ### Concurrency

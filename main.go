@@ -30,27 +30,28 @@ func printUsage() {
 
 Usage:
   age-plugin-agent intercept <plugin1>[,plugin2,...] [shell]
-  age-plugin-agent proxy <plugin-name>
-  age-plugin-agent server [socket-path]
+  age-plugin-agent proxy <plugin-name> --age-plugin=<state-machine>
+  age-plugin-agent server --plugin <abs-path> [--plugin <abs-path>...] [socket-path]
   age-plugin-agent --help
 
 Commands:
   intercept   Create a shell with specified plugins intercepted
   proxy       Connect to server and proxy stdin/stdout for a plugin
-  server      Start the agent server listening on a Unix socket
+  server      Start the agent server listening on a Unix socket. It runs only
+              the plugins given with --plugin, never anything from $PATH.
 
 Environment Variables:
   AGE_PLUGIN_AGENT_SOCKET   Path to Unix domain socket (default: ~/.age-plugin-agent.sock)
 
 Examples:
-  # Start the server
-  age-plugin-agent server
+  # Start the server, allowing only the yubikey plugin
+  age-plugin-agent server --plugin "$(command -v age-plugin-yubikey)"
 
   # Intercept yubikey plugin
   age-plugin-agent intercept yubikey
 
-  # Manually proxy to a plugin
-  age-plugin-agent proxy yubikey
+  # Manually proxy to a plugin, as age would invoke it
+  age-plugin-agent proxy yubikey --age-plugin=identity-v1
 
 When invoked via symlink as 'age-plugin-<name>', automatically runs in proxy mode.
 `)
@@ -60,7 +61,7 @@ func main() {
 	// Check binary name for automatic proxy mode detection
 	if pluginName, isPluginBinary := getPluginNameFromBinaryName(os.Args[0]); isPluginBinary {
 		// Automatically run in proxy mode for this plugin
-		if err := runProxy(pluginName); err != nil {
+		if err := runProxy(pluginName, os.Args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -103,18 +104,13 @@ func main() {
 		}
 		pluginName := os.Args[2]
 
-		if err := runProxy(pluginName); err != nil {
+		if err := runProxy(pluginName, os.Args[3:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "server":
-		socketPath := getSocketPath()
-		if len(os.Args) >= 3 {
-			socketPath = os.Args[2]
-		}
-
-		if err := runServer(socketPath); err != nil {
+		if err := runServer(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

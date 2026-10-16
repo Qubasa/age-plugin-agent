@@ -34,8 +34,8 @@ alias age-plugin-yubikey='age-plugin-agent'
 	* Otherwise, parse subcommands normally. [req.bpo0ci]
 * Subcommands: [req.nc6prq]
 	* `intercept`: Spins up a shell with the specified plugins in the $PATH. Creates symlinks to `age-plugin-agent` named `age-plugin-<name>` for each specified plugin, allowing automatic detection via binary name. [req.02pjoj]
-	* `proxy <plugin-name>`: Connects to the server socket, performs the handshake protocol (sends plugin name, receives OK/ERROR), then forwards STDIN to the socket and forwards responses from the socket back to STDOUT. [req.erkwws]
-	* `server`: Spins up the server that listens on a Unix domain socket for plugin requests. For each connection, it performs the handshake protocol to determine which plugin to execute, searches `$PATH` for the corresponding `age-plugin-[name]` binary, spawns the plugin subprocess, and transparently proxies data between the socket and the plugin's stdin/stdout. Once the plugin binary exits, the server closes the connection. [req.lv5ejb]
+	* `proxy <plugin-name> --age-plugin=<state-machine>`: Connects to the server socket, performs the handshake protocol (sends plugin name and the state machine age requested, receives OK/ERROR), then forwards STDIN to the socket and forwards responses from the socket back to STDOUT. It exits once the server closes the connection, without waiting for STDIN to end, because age keeps a plugin's STDIN open until it has the plugin's answer. [req.erkwws]
+	* `server --plugin <abs-path> [--plugin <abs-path>...] [socket-path]`: Spins up the server that listens on a Unix domain socket for plugin requests. Only the plugins given with `--plugin` can run, each an absolute path to an executable named `age-plugin-<name>`; `$PATH` is never searched, since the client chooses the name. For each connection, it performs the handshake protocol, spawns the chosen plugin as `<path> --age-plugin=<state-machine>`, and transparently proxies data between the socket and the plugin's stdin/stdout. Once the plugin binary exits and its output has been forwarded, the server closes the connection. The socket is created with mode 0600. [req.lv5ejb]
 * Socket: the socket is simply a file. The server listens on that socket for incoming plugin requests. The client connects to that socket and sends the plugin request. The server then forwards the request to the appropriate plugin and sends the response back to the client. This is meant to be used by forwarding the file via SSH. [req.nytk77]
 
 ## Handshake Protocol
@@ -45,11 +45,11 @@ Before proxying data to the plugin, the client and server perform a handshake to
 ### Protocol Flow
 
 1. **Client connects** to the Unix domain socket
-2. **Client sends plugin name**: `<plugin-name>\n`
-   - Format: UTF-8 encoded plugin name followed by newline (`\n`)
-   - Example: `yubikey\n`
-   - Plugin name must be alphanumeric with optional hyphens (validated by regex: `^[a-zA-Z0-9-]+$`)
-   - Maximum length: 64 characters
+2. **Client sends plugin name and state machine**: `<plugin-name> <state-machine>\n`
+   - Example: `yubikey identity-v1\n`
+   - Plugin name must be alphanumeric with optional hyphens (validated by regex: `^[a-zA-Z0-9-]+$`), max 64 characters
+   - State machine is `identity-v1` or `recipient-v1`, as age passes it in `--age-plugin=<state-machine>`
+   - The server reads at most 128 bytes for this line
 3. **Server validates and responds**:
    - **Success case**: Server sends `OK\n` and begins transparent proxying
    - **Error case**: Server sends `ERROR <message>\n` and closes the connection
@@ -58,45 +58,43 @@ Before proxying data to the plugin, the client and server perform a handshake to
    - Server proxies: socket → plugin stdin, plugin stdout → socket
 5. **Connection termination**: When plugin exits, server closes the socket connection
 
-### Server-Side Plugin Discovery
+### Server-Side Plugin Selection
 
-When the server receives a plugin name:
+When the server receives a handshake line:
 
 1. Validate the plugin name format (alphanumeric + hyphens only, max 64 chars)
-2. Search `$PATH` for an executable named `age-plugin-<name>`
-3. Validate the binary:
-   - File exists and is executable
-   - Follow symlinks
-   - Reject if not found or not executable
-4. If validation fails, send error response and close connection
-5. If validation succeeds, send `OK\n` response
+2. Validate the state machine (`identity-v1` or `recipient-v1`)
+3. Look the name up among the plugins passed with `--plugin`
+4. If any check fails, send an error response and close the connection
+5. Otherwise send `OK\n`
 
 ### Error Messages
 
-Error messages should be descriptive and follow this format:
-- `ERROR plugin not found: <name>\n` - Plugin binary not found in PATH
-- `ERROR invalid plugin name: <name>\n` - Plugin name contains invalid characters
-- `ERROR plugin not executable: <path>\n` - Plugin file exists but is not executable
+Client input is never echoed back unless it passed validation:
+- `ERROR invalid handshake\n` - Line missing, too long, or without a state machine
+- `ERROR invalid plugin name\n` - Plugin name contains invalid characters
+- `ERROR unsupported state machine\n` - State machine is not `identity-v1` or `recipient-v1`
+- `ERROR plugin not allowed: <name>\n` - Plugin was not passed to the server with `--plugin`
 
 ### Example Exchange
 
 **Successful handshake:**
 ```
-Client → Server: yubikey\n
+Client → Server: yubikey identity-v1\n
 Server → Client: OK\n
 [transparent proxying begins]
 ```
 
-**Failed handshake (plugin not found):**
+**Failed handshake (plugin not allowed):**
 ```
-Client → Server: nonexistent\n
-Server → Client: ERROR plugin not found: nonexistent\n
+Client → Server: nonexistent identity-v1\n
+Server → Client: ERROR plugin not allowed: nonexistent\n
 [connection closes]
 ```
 
 **Failed handshake (invalid name):**
 ```
-Client → Server: ../../../etc/passwd\n
-Server → Client: ERROR invalid plugin name: ../../../etc/passwd\n
+Client → Server: ../../../etc/passwd identity-v1\n
+Server → Client: ERROR invalid plugin name\n
 [connection closes]
 ```

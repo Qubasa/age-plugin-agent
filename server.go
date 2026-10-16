@@ -2,234 +2,229 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// findPluginBinary searches $PATH for the age plugin binary
-func findPluginBinary(pluginName string) (string, error) {
-	binaryName := "age-plugin-" + pluginName
+// stringList collects a repeatable flag.
+type stringList []string
 
-	// Search for binary in PATH
-	path, err := exec.LookPath(binaryName)
-	if err != nil {
-		return "", fmt.Errorf("plugin not found: %s", pluginName)
-	}
+func (s *stringList) String() string { return strings.Join(*s, ",") }
 
-	// Verify it's executable
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("plugin not found: %s", pluginName)
-	}
-
-	// Check if it's executable
-	if info.Mode()&0111 == 0 {
-		return "", fmt.Errorf("plugin not executable: %s", path)
-	}
-
-	return path, nil
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
-// performServerHandshake handles the server side of the handshake protocol
-func performServerHandshake(conn net.Conn) (string, error) {
-	// Set read timeout for handshake
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return "", fmt.Errorf("failed to set read deadline: %w", err)
+// loadPlugins maps plugin names to the executables the server may run. Only
+// these run: the client picks a name, so searching PATH would let anything
+// that can write to a PATH directory choose what the server executes.
+func loadPlugins(paths []string) (map[string]string, error) {
+	if len(paths) == 0 {
+		return nil, errors.New("at least one --plugin is required")
 	}
-
-	// Read plugin name
-	reader := bufio.NewReader(conn)
-	pluginNameLine, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("failed to read plugin name: %w", err)
-	}
-
-	pluginName := strings.TrimSpace(pluginNameLine)
-
-	// Validate plugin name
-	if err := validatePluginName(pluginName); err != nil {
-		errMsg := fmt.Sprintf("ERROR invalid plugin name: %s\n", pluginName)
-		conn.Write([]byte(errMsg))
-		return "", fmt.Errorf("invalid plugin name: %s", pluginName)
-	}
-
-	// Search for plugin binary
-	pluginPath, err := findPluginBinary(pluginName)
-	if err != nil {
-		var errMsg string
-		if strings.Contains(err.Error(), "not found") {
-			errMsg = fmt.Sprintf("ERROR plugin not found: %s\n", pluginName)
-		} else if strings.Contains(err.Error(), "not executable") {
-			errMsg = fmt.Sprintf("ERROR plugin not executable: %s\n", pluginPath)
-		} else {
-			errMsg = fmt.Sprintf("ERROR %s\n", err.Error())
+	plugins := make(map[string]string, len(paths))
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("plugin path must be absolute: %s", path)
 		}
-		conn.Write([]byte(errMsg))
-		return "", err
+		name, ok := getPluginNameFromBinaryName(path)
+		if !ok {
+			return nil, fmt.Errorf("plugin binary must be named age-plugin-<name>: %s", path)
+		}
+		if err := validatePluginName(name); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if _, dup := plugins[name]; dup {
+			return nil, fmt.Errorf("plugin %q given twice", name)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("plugin not found: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+			return nil, fmt.Errorf("plugin not executable: %s", path)
+		}
+		plugins[name] = path
 	}
-
-	// Send OK response
-	if _, err := conn.Write([]byte("OK\n")); err != nil {
-		return "", fmt.Errorf("failed to send OK response: %w", err)
-	}
-
-	// Clear read deadline for data proxying
-	conn.SetReadDeadline(time.Time{})
-
-	return pluginPath, nil
+	return plugins, nil
 }
 
-// handleConnection handles a single client connection (stub for now)
-func handleConnection(conn net.Conn) {
+// performServerHandshake reads "<plugin> <state-machine>" and answers OK or
+// ERROR. It returns the reader the client's further bytes must come from.
+func performServerHandshake(
+	conn net.Conn, plugins map[string]string,
+) (string, string, *bufio.Reader, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return "", "", nil, fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
+	reject := func(msg string) (string, string, *bufio.Reader, error) {
+		_, _ = fmt.Fprintf(conn, "ERROR %s\n", msg)
+		return "", "", nil, errors.New(msg)
+	}
+
+	reader := bufio.NewReaderSize(conn, maxHandshakeLine)
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return reject("invalid handshake")
+	}
+	name, stateMachine, ok := strings.Cut(strings.TrimSuffix(string(line), "\n"), " ")
+	if !ok {
+		return reject("invalid handshake")
+	}
+	if validatePluginName(name) != nil {
+		return reject("invalid plugin name")
+	}
+	if validateStateMachine(stateMachine) != nil {
+		return reject("unsupported state machine")
+	}
+	pluginPath, allowed := plugins[name]
+	if !allowed {
+		return reject("plugin not allowed: " + name)
+	}
+
+	if _, err := conn.Write([]byte("OK\n")); err != nil {
+		return "", "", nil, fmt.Errorf("failed to send OK response: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return "", "", nil, fmt.Errorf("failed to clear read deadline: %w", err)
+	}
+	return pluginPath, stateMachine, reader, nil
+}
+
+func handleConnection(conn *net.UnixConn, plugins map[string]string) {
 	defer conn.Close()
 
-	// Perform handshake
-	pluginPath, err := performServerHandshake(conn)
+	pluginPath, stateMachine, reader, err := performServerHandshake(conn, plugins)
 	if err != nil {
-		// Error already sent to client
 		fmt.Fprintf(os.Stderr, "Handshake failed: %v\n", err)
 		return
 	}
+	fmt.Printf("Running %s --age-plugin=%s\n", pluginPath, stateMachine)
 
-	fmt.Printf("Handshake successful, plugin: %s\n", pluginPath)
-
-	// Proxy to plugin (will be implemented in Phase 6)
-	if err := proxyToPlugin(conn, pluginPath); err != nil {
+	if err := proxyToPlugin(conn, reader, pluginPath, stateMachine); err != nil {
 		fmt.Fprintf(os.Stderr, "Plugin proxy error: %v\n", err)
 	}
 }
 
-// runServer implements the server subcommand
-func runServer(socketPath string) error {
-	// Remove existing socket file
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove existing socket: %w", err)
-	}
-
-	// Create Unix domain socket listener
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to create socket listener: %w", err)
-	}
-	defer listener.Close()
-	defer os.Remove(socketPath)
-
-	// Set socket permissions
-	if err := os.Chmod(socketPath, 0600); err != nil {
-		return fmt.Errorf("failed to set socket permissions: %w", err)
-	}
-
-	fmt.Printf("Server started, listening on: %s\n", socketPath)
-
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Channel to signal server to stop
-	stopChan := make(chan bool, 1)
-
-	// Goroutine to handle signals
-	go func() {
-		<-sigChan
-		fmt.Println("\nReceived shutdown signal, stopping server...")
-		stopChan <- true
-		listener.Close()
-	}()
-
-	// Accept loop
-	for {
-		select {
-		case <-stopChan:
-			fmt.Println("Server stopped")
-			return nil
-		default:
-			// Set a timeout for Accept to allow checking stopChan
-			if conn, err := listener.Accept(); err != nil {
-				// Check if error is due to listener being closed
-				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-					return nil
-				}
-				fmt.Fprintf(os.Stderr, "Accept error: %v\n", err)
-			} else {
-				fmt.Printf("Connection accepted from client\n")
-				go handleConnection(conn)
-			}
+// listen binds the socket with no group or other permissions from the start.
+// An existing socket from a previous run is replaced, anything else is not.
+func listen(socketPath string) (*net.UnixListener, error) {
+	if info, err := os.Lstat(socketPath); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("refusing to replace non-socket %s", socketPath)
 		}
+		if err := os.Remove(socketPath); err != nil {
+			return nil, fmt.Errorf("failed to remove existing socket: %w", err)
+		}
+	}
+	oldMask := syscall.Umask(0o077)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	syscall.Umask(oldMask)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create socket listener: %w", err)
+	}
+	return listener, nil
+}
+
+// serve accepts connections until the listener is closed.
+func serve(listener *net.UnixListener, plugins map[string]string) error {
+	for {
+		conn, err := listener.AcceptUnix()
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Accept error: %v\n", err)
+			continue
+		}
+		go handleConnection(conn, plugins)
 	}
 }
 
-// proxyToPlugin spawns the plugin subprocess and proxies data bidirectionally
-func proxyToPlugin(conn net.Conn, pluginPath string) error {
-	// Create command for the plugin
-	cmd := exec.Command(pluginPath)
+// runServer implements the server subcommand.
+func runServer(args []string) error {
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	var pluginPaths stringList
+	fs.Var(&pluginPaths, "plugin", "absolute path of an age-plugin-<name> the server may run (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	socketPath := getSocketPath()
+	switch fs.NArg() {
+	case 0:
+	case 1:
+		socketPath = fs.Arg(0)
+	default:
+		return fmt.Errorf("unexpected arguments: %q", fs.Args()[1:])
+	}
 
-	// Set up stdin pipe
+	plugins, err := loadPlugins(pluginPaths)
+	if err != nil {
+		return err
+	}
+	listener, err := listen(socketPath)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(socketPath)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("Received shutdown signal, stopping server...")
+		listener.Close()
+	}()
+
+	fmt.Printf("Server started, listening on: %s\n", socketPath)
+	return serve(listener, plugins)
+}
+
+// proxyToPlugin runs the plugin and proxies between it and the client until
+// the plugin exits. The plugin's stdout is drained before Wait, because Wait
+// closes the pipe and would otherwise drop the plugin's last messages.
+func proxyToPlugin(conn *net.UnixConn, fromConn io.Reader, pluginPath, stateMachine string) error {
+	cmd := exec.Command(pluginPath, stateMachineFlag+"="+stateMachine)
 	pluginStdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
-
-	// Set up stdout pipe
 	pluginStdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-
-	// Connect stderr to our stderr for debugging
 	cmd.Stderr = os.Stderr
 
-	// Start the plugin process
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start plugin: %w", err)
 	}
 
-	fmt.Printf("Plugin started: %s (PID: %d)\n", pluginPath, cmd.Process.Pid)
-
-	// Channel to collect errors from goroutines
-	done := make(chan error, 2)
-
-	// Goroutine 1: socket -> plugin stdin
 	go func() {
-		_, err := io.Copy(pluginStdin, conn)
-		pluginStdin.Close()
-		done <- err
+		_, _ = io.Copy(pluginStdin, fromConn)
+		_ = pluginStdin.Close()
 	}()
 
-	// Goroutine 2: plugin stdout -> socket
-	go func() {
-		_, err := io.Copy(conn, pluginStdout)
-		done <- err
-	}()
-
-	// Wait for plugin process to exit
-	processErr := cmd.Wait()
-
-	// Close connection to stop goroutines
+	_, copyErr := io.Copy(conn, pluginStdout)
+	waitErr := cmd.Wait()
 	conn.Close()
 
-	// Collect errors from goroutines
-	err1 := <-done
-	err2 := <-done
-
-	fmt.Printf("Plugin exited: %s (PID: %d)\n", pluginPath, cmd.Process.Pid)
-
-	// Return first non-nil error
-	if processErr != nil {
-		return fmt.Errorf("plugin process error: %w", processErr)
+	if waitErr != nil {
+		return fmt.Errorf("plugin process error: %w", waitErr)
 	}
-	if err1 != nil {
-		return fmt.Errorf("socket to plugin error: %w", err1)
+	if copyErr != nil {
+		return fmt.Errorf("plugin to socket error: %w", copyErr)
 	}
-	if err2 != nil {
-		return fmt.Errorf("plugin to socket error: %w", err2)
-	}
-
 	return nil
 }

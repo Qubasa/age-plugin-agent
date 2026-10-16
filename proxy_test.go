@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,113 +10,87 @@ import (
 	"time"
 )
 
+// shortSocketPath keeps the path under the 108-byte AF_UNIX limit.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "apa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "s")
+}
+
 func TestPerformClientHandshake(t *testing.T) {
 	tests := []struct {
 		name           string
-		pluginName     string
 		serverResponse string
-		wantErr        bool
 		errContains    string
 	}{
+		{name: "ok", serverResponse: "OK\n"},
 		{
-			name:           "successful handshake",
-			pluginName:     "yubikey",
-			serverResponse: "OK\n",
-			wantErr:        false,
+			name:           "server error",
+			serverResponse: "ERROR plugin not allowed: yubikey\n",
+			errContains:    "plugin not allowed",
 		},
 		{
-			name:           "server error - plugin not found",
-			pluginName:     "nonexistent",
-			serverResponse: "ERROR plugin not found: nonexistent\n",
-			wantErr:        true,
-			errContains:    "plugin not found",
-		},
-		{
-			name:           "server error - invalid plugin name",
-			pluginName:     "test",
-			serverResponse: "ERROR invalid plugin name: ../passwd\n",
-			wantErr:        true,
-			errContains:    "invalid plugin name",
-		},
-		{
-			name:           "invalid plugin name client-side",
-			pluginName:     "../../../etc/passwd",
-			serverResponse: "",
-			wantErr:        true,
-			errContains:    "invalid plugin name",
+			name:           "garbage response",
+			serverResponse: "HELLO\n",
+			errContains:    "unexpected handshake response",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.pluginName == "../../../etc/passwd" {
-				// Client-side validation should fail before connection
-				err := performClientHandshake(nil, tt.pluginName)
-				if (err != nil) != tt.wantErr {
-					t.Errorf("performClientHandshake() error = %v, wantErr %v", err, tt.wantErr)
-				}
-				if err != nil && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("error should contain %q, got %q", tt.errContains, err.Error())
-				}
-				return
-			}
-
-			// Create a mock server for other tests
-			socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("test-socket-%d.sock", time.Now().UnixNano()))
-			defer os.Remove(socketPath)
-
-			listener, err := net.Listen("unix", socketPath)
+			listener, err := net.Listen("unix", shortSocketPath(t))
 			if err != nil {
-				t.Fatalf("Failed to create test listener: %v", err)
+				t.Fatal(err)
 			}
 			defer listener.Close()
 
-			// Start mock server in goroutine
-			done := make(chan bool)
+			received := make(chan string, 1)
 			go func() {
 				conn, err := listener.Accept()
 				if err != nil {
 					return
 				}
 				defer conn.Close()
-
-				// Read plugin name
-				reader := bufio.NewReader(conn)
-				_, err = reader.ReadString('\n')
-				if err != nil {
-					return
-				}
-
-				// Send response
-				conn.Write([]byte(tt.serverResponse))
-				done <- true
+				line, _ := bufio.NewReader(conn).ReadString('\n')
+				received <- line
+				_, _ = conn.Write([]byte(tt.serverResponse))
 			}()
 
-			// Connect client
-			conn, err := net.Dial("unix", socketPath)
+			conn, err := net.Dial("unix", listener.Addr().String())
 			if err != nil {
-				t.Fatalf("Failed to connect to test server: %v", err)
+				t.Fatal(err)
 			}
 			defer conn.Close()
 
-			// Perform handshake
-			err = performClientHandshake(conn, tt.pluginName)
+			_, err = performClientHandshake(conn, "yubikey", "identity-v1")
 
-			// Wait for server to finish
 			select {
-			case <-done:
+			case line := <-received:
+				if line != "yubikey identity-v1\n" {
+					t.Errorf("server received %q, want %q", line, "yubikey identity-v1\n")
+				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("Test timeout")
+				t.Fatal("server never received the handshake")
 			}
-
-			// Check error
-			if (err != nil) != tt.wantErr {
-				t.Errorf("performClientHandshake() error = %v, wantErr %v", err, tt.wantErr)
-			}
-
-			if err != nil && tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-				t.Errorf("error should contain %q, got %q", tt.errContains, err.Error())
+			switch {
+			case tt.errContains == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tt.errContains != "" && (err == nil || !strings.Contains(err.Error(), tt.errContains)):
+				t.Errorf("error = %v, want it to contain %q", err, tt.errContains)
 			}
 		})
+	}
+}
+
+func TestPerformClientHandshakeRejectsBadInputBeforeSending(t *testing.T) {
+	if _, err := performClientHandshake(nil, "../../../etc/passwd", "identity-v1"); err == nil {
+		t.Error("expected invalid plugin name error")
+	}
+	if _, err := performClientHandshake(nil, "yubikey", "keygen"); err == nil {
+		t.Error("expected unsupported state machine error")
 	}
 }
