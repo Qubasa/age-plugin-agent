@@ -15,43 +15,15 @@ import (
 
 const pluginName = "hostkey"
 
-// zenityPath is the default approval dialog. Nix builds set it to a store path.
-var zenityPath = "zenity"
-
-type config struct {
-	keyFile  string
-	ttl      time.Duration
-	stateDir string
-	zenity   string
-}
-
-func loadConfig() (config, error) {
-	cfg := config{
-		keyFile: os.Getenv("AGE_PLUGIN_HOSTKEY_FILE"),
-		ttl:     15 * time.Minute,
-		zenity:  zenityPath,
+func keyFilePath() (string, error) {
+	if path := os.Getenv("AGE_PLUGIN_HOSTKEY_FILE"); path != "" {
+		return path, nil
 	}
-	if cfg.keyFile == "" {
-		configDir, err := os.UserConfigDir()
-		if err != nil {
-			return config{}, err
-		}
-		cfg.keyFile = filepath.Join(configDir, "sops", "age", "keys.txt")
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
 	}
-	if raw := os.Getenv("AGE_PLUGIN_HOSTKEY_TTL"); raw != "" {
-		ttl, err := time.ParseDuration(raw)
-		if err != nil || ttl < 0 {
-			return config{}, fmt.Errorf("AGE_PLUGIN_HOSTKEY_TTL: invalid duration %q", raw)
-		}
-		cfg.ttl = ttl
-	}
-	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		cfg.stateDir = filepath.Join(runtimeDir, "age-plugin-hostkey")
-	}
-	if zenity := os.Getenv("AGE_PLUGIN_HOSTKEY_ZENITY"); zenity != "" {
-		cfg.zenity = zenity
-	}
-	return cfg, nil
+	return filepath.Join(configDir, "sops", "age", "keys.txt"), nil
 }
 
 type hostKey struct {
@@ -83,10 +55,7 @@ func loadKeys(path string) ([]hostKey, error) {
 	return keys, nil
 }
 
-// hostIdentity unwraps with every host key, and releases a file key only
-// after approval. Files not encrypted to a host key never trigger a prompt.
 type hostIdentity struct {
-	cfg  config
 	keys []hostKey
 	log  io.Writer
 }
@@ -100,12 +69,8 @@ func (h *hostIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		decision, err := approve(h.cfg, key.recipient)
-		fmt.Fprintf(h.log, "age-plugin-hostkey: %s %s: %s\n",
-			time.Now().Format(time.RFC3339), key.recipient, decision)
-		if err != nil {
-			return nil, err
-		}
+		fmt.Fprintf(h.log, "age-plugin-hostkey: %s %s: released\n",
+			time.Now().Format(time.RFC3339), key.recipient)
 		return fileKey, nil
 	}
 	return nil, age.ErrIncorrectIdentity
@@ -135,14 +100,14 @@ func run() int {
 		"print the placeholder identity file for the keys in the key file")
 	flag.Parse()
 
-	cfg, err := loadConfig()
+	keyFile, err := keyFilePath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "age-plugin-hostkey: %v\n", err)
 		return 1
 	}
 
 	if *printID {
-		keys, err := loadKeys(cfg.keyFile)
+		keys, err := loadKeys(keyFile)
 		if err == nil {
 			err = printIdentity(os.Stdout, keys)
 		}
@@ -157,11 +122,11 @@ func run() int {
 		if len(data) != 0 {
 			return nil, errors.New("unexpected identity data")
 		}
-		keys, err := loadKeys(cfg.keyFile)
+		keys, err := loadKeys(keyFile)
 		if err != nil {
 			return nil, err
 		}
-		return &hostIdentity{cfg: cfg, keys: keys, log: os.Stderr}, nil
+		return &hostIdentity{keys: keys, log: os.Stderr}, nil
 	})
 	return p.Main()
 }
