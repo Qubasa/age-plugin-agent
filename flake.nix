@@ -14,8 +14,12 @@
         pname = "age-plugin-agent";
         version = "0.1.0";
         src = self;
-        # No external Go module dependencies
-        vendorHash = null;
+        vendorHash = "sha256-p6lVdx5QopCBFfk7JV877nv1kjd78ZijAO1D6Kh7EQk=";
+
+        # age-plugin-hostkey's approval dialog, so it works under a minimal PATH
+        ldflags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+          "-X main.zenityPath=${pkgs.lib.getExe pkgs.zenity}"
+        ];
 
         meta = with pkgs.lib; {
           description = "Age plugin proxy agent that forwards encryption/decryption to a remote server";

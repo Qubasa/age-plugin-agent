@@ -98,3 +98,14 @@ Client → Server: ../../../etc/passwd identity-v1\n
 Server → Client: ERROR invalid plugin name\n
 [connection closes]
 ```
+
+# age-plugin-hostkey
+
+A second binary, `age-plugin-hostkey`, meant to be the plugin the server runs. It lets a client decrypt files encrypted to native age keys (`AGE-SECRET-KEY-1…`, `AGE-SECRET-KEY-PQ-1…`) that only exist on the server's host.
+
+* The client's identity file holds a placeholder with no secret, printed by `age-plugin-hostkey --print-identity`: one `# recipient: age1…` comment per host key, then `AGE-PLUGIN-HOSTKEY-1…`. Tools such as clan read the public keys from the comments.
+* On `identity-v1`, it unwraps with every key in `AGE_PLUGIN_HOSTKEY_FILE` (default `$XDG_CONFIG_HOME/sops/age/keys.txt`). Only when a key matches does it ask for approval, so files for other keys never prompt.
+* Approval is a zenity dialog on the host (`AGE_PLUGIN_HOSTKEY_ZENITY` overrides the binary). A denial, a timeout after 60 seconds, or a dialog that fails to run releases nothing.
+* An approval lasts `AGE_PLUGIN_HOSTKEY_TTL` (Go duration, default `15m`, `0` asks every time). It is stored in `$XDG_RUNTIME_DIR/age-plugin-hostkey/approved-until`, which must be a 0700 directory; without `XDG_RUNTIME_DIR` every decryption asks. Concurrent plugin processes take a lock there, so one dialog covers all of them.
+* Each released or refused file key is logged to stderr with time, recipient and decision. Under the server, that is the server's log.
+* The approval state directory must not be writable from wherever the client runs, or the client could approve itself.
